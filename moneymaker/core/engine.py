@@ -23,6 +23,7 @@ from moneymaker.strategies import (
     Strategy,
     StrategyRegistry,
 )
+from moneymaker.web import StatusServer
 
 
 class TradingEngine:
@@ -54,6 +55,9 @@ class TradingEngine:
         # Initialize strategy registry
         self.strategies = StrategyRegistry()
         self._init_strategies()
+
+        # Web status server
+        self.status_server = StatusServer(self.portfolio)
 
         # Trading state
         self.symbols: list[str] = ["DOGE/USDT"]  # Start with DOGE
@@ -168,6 +172,9 @@ class TradingEngine:
 
         # Print summary
         self._print_portfolio_summary()
+
+        # Update status server
+        self.status_server.update_cycle(self._cycle_count)
 
         return summary
 
@@ -347,6 +354,9 @@ class TradingEngine:
         # Load existing state
         self.portfolio.load_state()
 
+        # Start web status server
+        await self.status_server.start()
+
         cycle_count = 0
         while self.running:
             try:
@@ -376,6 +386,7 @@ class TradingEngine:
     async def shutdown(self) -> None:
         """Clean shutdown."""
         self.running = False
+        await self.status_server.stop()
         await self.market_data.close()
         await self.executor.close()
         self.portfolio.take_snapshot()
