@@ -38,21 +38,18 @@ class Settings(BaseSettings):
     kraken_api_key: str = Field(default="")
     kraken_api_secret: str = Field(default="")
 
-    # Sentiment APIs
-    reddit_client_id: str = Field(default="")
-    reddit_client_secret: str = Field(default="")
-    twitter_bearer_token: str = Field(default="")
-
     # Trading configuration
     trading_mode: TradingMode = Field(default=TradingMode.PAPER)
     initial_capital: float = Field(default=250.0)
     base_currency: str = Field(default="USDT")
-    preferred_exchange: Exchange = Field(default=Exchange.COINBASE)
+    preferred_exchange: Exchange = Field(default=Exchange.BINANCE)
 
-    # Strategy defaults
-    loop_interval_minutes: int = Field(default=60)  # How often to run the loop
-    min_trade_size_usd: float = Field(default=5.0)  # Minimum trade size
-    max_position_pct: float = Field(default=0.25)  # Max 25% in any single position
+    # Loop and trading settings
+    loop_interval_minutes: int = Field(default=120)  # Every 2 hours
+    min_trade_size_usd: float = Field(default=10.0)  # Binance minimum
+    max_position_pct: float = Field(default=0.80)  # Max 80% in single position (aggressive)
+    min_cash_pct: float = Field(default=0.05)  # Minimum 5% cash reserve
+    universe_size: int = Field(default=50)  # Top N coins by volume
 
     # Paths
     data_dir: Path = Field(default=Path("data"))

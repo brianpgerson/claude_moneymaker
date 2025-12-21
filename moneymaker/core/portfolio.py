@@ -1,7 +1,9 @@
 """Portfolio management and tracking."""
 
+import json
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import sqlite_utils
 
@@ -17,6 +19,7 @@ class PortfolioManager:
     - Current cash balance
     - Open positions
     - Trade history
+    - Claude's decisions
     - P&L over time
     """
 
@@ -79,15 +82,17 @@ class PortfolioManager:
                 "total_pnl_pct": float,
             }, pk="id")
 
-        # Strategy P&L tracking
-        if "strategy_pnl" not in self.db.table_names():
-            self.db["strategy_pnl"].create({
+        # Claude's decisions (for analysis)
+        if "decisions" not in self.db.table_names():
+            self.db["decisions"].create({
                 "id": int,
-                "strategy_name": str,
                 "timestamp": str,
-                "trade_pnl": float,
-                "trade_pnl_pct": float,
-                "cumulative_pnl": float,
+                "portfolio_before": str,  # JSON
+                "market_summary": str,    # JSON
+                "target_allocation": str, # JSON
+                "conviction": str,
+                "reasoning": str,
+                "trades_executed": str,   # JSON
             }, pk="id")
 
     def get_state(self) -> PortfolioState:
@@ -106,6 +111,78 @@ class PortfolioManager:
     def get_all_positions(self) -> dict[str, Position]:
         """Get all current positions."""
         return dict(self._state.positions)
+
+    def get_holdings_summary(self) -> list[dict]:
+        """
+        Get a summary of current holdings for the engine.
+
+        Returns list of dicts with symbol, quantity, value, percent, pnl_pct.
+        Always includes USDT (cash).
+        """
+        state = self.get_state()
+        holdings = []
+
+        # Add cash
+        if state.cash_balance > 0:
+            holdings.append({
+                "symbol": "USDT",
+                "quantity": state.cash_balance,
+                "value": state.cash_balance,
+                "percent": (state.cash_balance / state.total_value * 100)
+                           if state.total_value > 0 else 100,
+                "pnl_pct": 0,
+            })
+
+        # Add positions
+        for symbol, pos in state.positions.items():
+            value = pos.quantity * pos.current_price
+            holdings.append({
+                "symbol": symbol.replace("/USDT", ""),  # Store without pair suffix
+                "quantity": pos.quantity,
+                "value": value,
+                "percent": (value / state.total_value * 100)
+                           if state.total_value > 0 else 0,
+                "pnl_pct": pos.unrealized_pnl_pct,
+                "entry_price": pos.average_entry_price,
+            })
+
+        return holdings
+
+    def sync_from_exchange(self, exchange_balances: dict[str, float]) -> None:
+        """
+        Sync portfolio state from exchange balances.
+
+        Called in live mode to ensure we have ground truth.
+        """
+        base = self.settings.base_currency  # USDT
+
+        # Update cash
+        self._state.cash_balance = exchange_balances.get(base, 0)
+
+        # Update positions - need to fetch current prices
+        # For now, just update quantities
+        new_positions = {}
+        for symbol, quantity in exchange_balances.items():
+            if symbol == base or quantity <= 0:
+                continue
+
+            full_symbol = f"{symbol}/{base}"
+
+            if full_symbol in self._state.positions:
+                # Keep existing position data, update quantity
+                pos = self._state.positions[full_symbol]
+                pos.quantity = quantity
+                new_positions[full_symbol] = pos
+            else:
+                # New position - we don't know entry price, use 0
+                new_positions[full_symbol] = Position(
+                    symbol=full_symbol,
+                    quantity=quantity,
+                    average_entry_price=0,  # Unknown
+                    current_price=0,
+                )
+
+        self._state.positions = new_positions
 
     def update_position(
         self,
@@ -186,29 +263,41 @@ class PortfolioManager:
             "reasoning": order.reasoning,
         })
 
-    def record_strategy_pnl(
+    def record_decision(
         self,
-        strategy_name: str,
-        trade_pnl: float,
-        trade_pnl_pct: float,
+        portfolio_before: list[dict],
+        market_summary: dict[str, Any],
+        target_allocation: list[dict],
+        conviction: str | None,
+        reasoning: str | None,
+        trades_executed: list[dict],
     ) -> None:
-        """Record P&L for a strategy."""
-        # Get cumulative P&L
-        existing = list(self.db["strategy_pnl"].rows_where(
-            "strategy_name = ?",
-            [strategy_name],
-            order_by="-id",
-            limit=1,
-        ))
-        cumulative = existing[0]["cumulative_pnl"] if existing else 0
-
-        self.db["strategy_pnl"].insert({
-            "strategy_name": strategy_name,
+        """Record Claude's decision for later analysis."""
+        self.db["decisions"].insert({
             "timestamp": datetime.utcnow().isoformat(),
-            "trade_pnl": trade_pnl,
-            "trade_pnl_pct": trade_pnl_pct,
-            "cumulative_pnl": cumulative + trade_pnl,
+            "portfolio_before": json.dumps(portfolio_before),
+            "market_summary": json.dumps(market_summary),
+            "target_allocation": json.dumps(target_allocation),
+            "conviction": conviction,
+            "reasoning": reasoning,
+            "trades_executed": json.dumps(trades_executed),
         })
+
+    def get_recent_decisions(self, limit: int = 10) -> list[dict]:
+        """Get recent decisions for analysis."""
+        decisions = list(self.db["decisions"].rows_where(
+            order_by="-id",
+            limit=limit,
+        ))
+
+        # Parse JSON fields
+        for d in decisions:
+            d["portfolio_before"] = json.loads(d["portfolio_before"])
+            d["market_summary"] = json.loads(d["market_summary"])
+            d["target_allocation"] = json.loads(d["target_allocation"])
+            d["trades_executed"] = json.loads(d["trades_executed"])
+
+        return decisions
 
     def take_snapshot(self) -> None:
         """Record current portfolio state."""

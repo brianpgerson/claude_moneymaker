@@ -1,12 +1,12 @@
 """Core trading engine components."""
 
-from moneymaker.core.allocator import CapitalAllocator
+from moneymaker.core.brain import TradingBrain
 from moneymaker.core.executor import TradeExecutor
 from moneymaker.core.portfolio import PortfolioManager
 from moneymaker.core.engine import TradingEngine
 
 __all__ = [
-    "CapitalAllocator",
+    "TradingBrain",
     "TradeExecutor",
     "PortfolioManager",
     "TradingEngine",
