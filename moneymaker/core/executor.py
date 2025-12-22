@@ -5,9 +5,12 @@ from datetime import datetime
 from typing import Any
 
 import ccxt.async_support as ccxt
+from rich.console import Console
 
 from moneymaker.config import Exchange, Settings, TradingMode
 from moneymaker.models import Order, OrderSide, OrderStatus, OrderType
+
+console = Console()
 
 
 class TradeExecutor:
@@ -40,29 +43,41 @@ class TradeExecutor:
         exchange_classes = {
             Exchange.COINBASE: ccxt.coinbase,
             Exchange.BINANCE: ccxt.binance,
+            Exchange.BINANCEUS: ccxt.binanceus,
             Exchange.KRAKEN: ccxt.kraken,
         }
 
         exchange_class = exchange_classes[self.settings.preferred_exchange]
 
-        # Never use sandbox - we want real market data
-        # Paper trading simulates locally with real prices
-        self._exchange = exchange_class({
-            "apiKey": api_key or "paper_trading",
-            "secret": api_secret or "paper_trading",
+        # For paper trading, don't pass API credentials - just use public endpoints
+        # For live trading, credentials are required
+        config = {
             "enableRateLimit": True,
             "options": {
                 "defaultType": "spot",
             },
-        })
+        }
+
+        if self.settings.trading_mode == TradingMode.LIVE and api_key and api_secret:
+            config["apiKey"] = api_key
+            config["secret"] = api_secret
+            config["options"]["warnOnFetchOpenOrdersWithoutSymbol"] = False
+            console.print(f"[green]LIVE MODE: Using Binance API credentials (key: {api_key[:8]}...)[/]")
+        elif self.settings.trading_mode == TradingMode.LIVE:
+            console.print(f"[red]LIVE MODE WARNING: No API credentials found! api_key={bool(api_key)}, api_secret={bool(api_secret)}[/]")
+        else:
+            console.print(f"[yellow]PAPER MODE: Using public endpoints (no credentials)[/]")
+
+        self._exchange = exchange_class(config)
 
         return self._exchange
 
-    async def sync_balances(self) -> dict[str, float]:
+    async def sync_balances(self) -> dict[str, float] | None:
         """
         Sync balances from the exchange.
 
         Returns dict of {symbol: quantity} for all non-zero balances.
+        Returns None on API failure (caller should not sync to empty state).
         For paper trading, returns empty dict (portfolio manager tracks internally).
         """
         if self.settings.trading_mode == TradingMode.PAPER:
@@ -82,8 +97,8 @@ class TradeExecutor:
             return holdings
 
         except Exception as e:
-            print(f"Error syncing balances: {e}")
-            return {}
+            console.print(f"[red]Error syncing balances: {e}[/]")
+            return None  # Return None to indicate failure, not empty state
 
     async def cancel_all_orders(self) -> list[str]:
         """
@@ -152,13 +167,18 @@ class TradeExecutor:
         # Calculate target values
         target_values = {sym: pct * total_value for sym, pct in target_map.items()}
 
-        # Calculate current values (excluding base currency)
+        # Calculate current values (excluding base currency and dust < $1)
         current_values = {}
         for sym, qty in current_holdings.items():
             if sym != base and qty > 0:
                 price = prices.get(f"{sym}/{base}")
-                if price:
-                    current_values[sym] = qty * price
+                if price is not None and price > 0:
+                    value = qty * price
+                    if value < 1.0:  # Skip dust positions
+                        continue
+                    current_values[sym] = value
+                else:
+                    console.print(f"[yellow]  Warning: No valid price for {sym}, skipping[/]")
 
         # Determine sells (reduce or exit positions)
         sells = []
@@ -169,13 +189,15 @@ class TradeExecutor:
             if diff > self.settings.min_trade_size_usd:
                 # Need to sell some
                 price = prices.get(f"{sym}/{base}")
-                if price:
+                if price is not None and price > 0:
                     qty_to_sell = diff / price
                     sells.append({
                         "symbol": f"{sym}/{base}",
                         "quantity": qty_to_sell,
                         "value": diff,
                     })
+                else:
+                    console.print(f"[red]  Cannot sell {sym}: no valid price[/]")
 
         # Determine buys (new or increasing positions)
         buys = []
@@ -186,13 +208,15 @@ class TradeExecutor:
             if diff > self.settings.min_trade_size_usd:
                 # Need to buy some
                 price = prices.get(f"{sym}/{base}")
-                if price:
+                if price is not None and price > 0:
                     qty_to_buy = diff / price
                     buys.append({
                         "symbol": f"{sym}/{base}",
                         "quantity": qty_to_buy,
                         "value": diff,
                     })
+                else:
+                    console.print(f"[red]  Cannot buy {sym}: no valid price[/]")
 
         # Execute sells first
         for sell in sells:
@@ -230,8 +254,10 @@ class TradeExecutor:
         For live trading, actually places the order on the exchange.
         """
         if self.settings.trading_mode == TradingMode.PAPER:
+            console.print(f"[yellow]PAPER: Simulating {order.side.value} {order.quantity:.4f} {order.symbol}[/]")
             return await self._execute_paper(order)
         else:
+            console.print(f"[bold green]LIVE: Executing {order.side.value} {order.quantity:.4f} {order.symbol}[/]")
             return await self._execute_live(order)
 
     async def _execute_paper(self, order: Order) -> Order:
@@ -265,21 +291,25 @@ class TradeExecutor:
 
     async def _execute_live(self, order: Order) -> Order:
         """Execute a real order on the exchange."""
+        console.print(f"[cyan]LIVE ORDER: {order.side.value.upper()} {order.quantity} {order.symbol}[/]")
         exchange = await self._get_exchange()
 
         try:
             if order.order_type == OrderType.MARKET:
                 if order.side == OrderSide.BUY:
+                    console.print(f"[cyan]  Sending market buy to Binance...[/]")
                     result = await exchange.create_market_buy_order(
                         order.symbol,
                         order.quantity,
                     )
                 else:
+                    console.print(f"[cyan]  Sending market sell to Binance...[/]")
                     result = await exchange.create_market_sell_order(
                         order.symbol,
                         order.quantity,
                     )
             else:  # LIMIT
+                console.print(f"[cyan]  Sending limit order to Binance...[/]")
                 result = await exchange.create_limit_order(
                     order.symbol,
                     order.side.value,
@@ -287,24 +317,39 @@ class TradeExecutor:
                     order.price,
                 )
 
+            console.print(f"[green]  Binance response: id={result.get('id')}, status={result.get('status')}, filled={result.get('filled')}[/]")
+
             order.id = result["id"]
-            order.filled_quantity = result.get("filled", order.quantity)
-            order.filled_price = result.get("average", result.get("price"))
+            order.filled_quantity = result.get("filled") or result.get("amount") or order.quantity
+            # Get filled price with multiple fallbacks
+            filled_price = result.get("average") or result.get("price") or result.get("cost")
+            if filled_price is None and result.get("cost") and order.filled_quantity:
+                # Calculate from cost / quantity if available
+                filled_price = result.get("cost") / order.filled_quantity
+            order.filled_price = filled_price or 0
             order.executed_at = datetime.utcnow()
+
+            if order.filled_price == 0:
+                console.print(f"[red]  Warning: Could not determine fill price from response[/]")
 
             # Determine status
             if result.get("status") == "closed":
                 order.status = OrderStatus.FILLED
+                console.print(f"[green]  Order FILLED @ ${order.filled_price:.6f}[/]")
             elif result.get("status") == "canceled":
                 order.status = OrderStatus.CANCELLED
+                console.print(f"[yellow]  Order CANCELLED[/]")
             elif order.filled_quantity > 0:
                 order.status = OrderStatus.PARTIALLY_FILLED
+                console.print(f"[yellow]  Order PARTIALLY FILLED[/]")
             else:
                 order.status = OrderStatus.PENDING
+                console.print(f"[yellow]  Order PENDING[/]")
 
             return order
 
         except Exception as e:
+            console.print(f"[red]  LIVE ORDER FAILED: {e}[/]")
             order.status = OrderStatus.FAILED
             order.reasoning = f"Order failed: {e}"
             return order
@@ -345,13 +390,18 @@ class TradeExecutor:
                     prices[symbol] = ticker["last"]
         except Exception as e:
             # Fallback to individual fetches
-            print(f"Bulk ticker fetch failed, falling back: {e}")
+            console.print(f"[yellow]Bulk ticker fetch failed, falling back: {e}[/]")
             for symbol in symbols:
                 try:
                     ticker = await exchange.fetch_ticker(symbol)
                     prices[symbol] = ticker["last"]
-                except Exception:
-                    pass
+                except Exception as e2:
+                    console.print(f"[red]  Failed to fetch price for {symbol}: {e2}[/]")
+
+        # Report any missing prices
+        missing = set(symbols) - set(prices.keys())
+        if missing:
+            console.print(f"[yellow]  Missing prices for: {', '.join(missing)}[/]")
 
         return prices
 

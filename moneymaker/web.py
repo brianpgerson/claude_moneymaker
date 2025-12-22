@@ -109,10 +109,15 @@ class StatusServer:
                 <td>{t["created_at"][:16]}</td>
                 <td>{t["symbol"]}</td>
                 <td class="{'positive' if t['side'] == 'buy' else 'negative'}">{t["side"].upper()}</td>
-                <td>${t["filled_price"]:.6f if t["filled_price"] else 0:.6f}</td>
+                <td>${(t["filled_price"] or 0):.6f}</td>
             </tr>
             ''' for t in trades) or '<tr><td colspan="4" class="dim">No trades yet</td></tr>'}
         </table>
+    </div>
+
+    <div class="card">
+        <h3>Portfolio History</h3>
+        <canvas id="chart" height="150"></canvas>
     </div>
 
     <div class="card">
@@ -126,6 +131,71 @@ class StatusServer:
     </div>
 
     <p class="dim">Auto-refreshes every 60 seconds</p>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script>
+        fetch('/api/snapshots')
+            .then(r => r.json())
+            .then(data => {{
+                const snapshots = data.snapshots;
+                const initial = data.initial_capital;
+                if (!snapshots.length) return;
+
+                const labels = snapshots.map(s => s.timestamp.slice(5, 16).replace('T', ' '));
+                const values = snapshots.map(s => s.total_value);
+                const initialLine = snapshots.map(() => initial);
+
+                // Calculate BTC baseline: what if we just held BTC?
+                const firstBtcPrice = snapshots.find(s => s.btc_price)?.btc_price;
+                const btcBaseline = firstBtcPrice
+                    ? snapshots.map(s => s.btc_price ? (initial / firstBtcPrice) * s.btc_price : null)
+                    : null;
+
+                const datasets = [
+                    {{
+                        label: 'Claude Portfolio',
+                        data: values,
+                        borderColor: '#00d4ff',
+                        backgroundColor: 'rgba(0, 212, 255, 0.1)',
+                        fill: true,
+                        tension: 0.3
+                    }},
+                    {{
+                        label: 'Initial ($' + initial + ')',
+                        data: initialLine,
+                        borderColor: '#666',
+                        borderDash: [5, 5],
+                        pointRadius: 0
+                    }}
+                ];
+
+                if (btcBaseline) {{
+                    datasets.push({{
+                        label: 'Just Hold BTC',
+                        data: btcBaseline,
+                        borderColor: '#f7931a',
+                        borderWidth: 2,
+                        pointRadius: 0,
+                        tension: 0.3
+                    }});
+                }}
+
+                new Chart(document.getElementById('chart'), {{
+                    type: 'line',
+                    data: {{ labels: labels, datasets: datasets }},
+                    options: {{
+                        responsive: true,
+                        plugins: {{
+                            legend: {{ labels: {{ color: '#eee' }} }}
+                        }},
+                        scales: {{
+                            x: {{ ticks: {{ color: '#888' }}, grid: {{ color: '#333' }} }},
+                            y: {{ ticks: {{ color: '#888' }}, grid: {{ color: '#333' }} }}
+                        }}
+                    }}
+                }});
+            }});
+    </script>
 </body>
 </html>"""
         return web.Response(text=html, content_type='text/html')
@@ -153,12 +223,70 @@ class StatusServer:
             "cycles": self._cycle_count,
         })
 
+    async def handle_test_keys(self, request: web.Request) -> web.Response:
+        """Test Binance API keys endpoint."""
+        import ccxt.async_support as ccxt
+        settings = get_settings()
+
+        results = {
+            "binance_key_set": bool(settings.binance_api_key),
+            "binance_secret_set": bool(settings.binance_api_secret),
+            "key_prefix": settings.binance_api_key[:8] + "..." if settings.binance_api_key else None,
+            "tests": {}
+        }
+
+        if not settings.binance_api_key or not settings.binance_api_secret:
+            results["error"] = "API keys not configured"
+            return web.json_response(results)
+
+        exchange = ccxt.binance({
+            "apiKey": settings.binance_api_key,
+            "secret": settings.binance_api_secret,
+            "enableRateLimit": True,
+        })
+
+        try:
+            # Test balance fetch
+            balance = await exchange.fetch_balance()
+            usdt = balance.get("USDT", {}).get("free", 0)
+            results["tests"]["fetch_balance"] = {"success": True, "usdt_balance": usdt}
+
+            # Test market data
+            ticker = await exchange.fetch_ticker("BTC/USDT")
+            results["tests"]["fetch_ticker"] = {"success": True, "btc_price": ticker["last"]}
+
+            # Test spot trading permission
+            orders = await exchange.fetch_open_orders("BTC/USDT")
+            results["tests"]["spot_trading"] = {"success": True, "open_orders": len(orders)}
+
+            results["all_passed"] = True
+
+        except Exception as e:
+            results["error"] = str(e)
+            results["all_passed"] = False
+        finally:
+            await exchange.close()
+
+        return web.json_response(results)
+
+    async def handle_snapshots(self, request: web.Request) -> web.Response:
+        """Return portfolio snapshot history for charting."""
+        snapshots = self.portfolio.get_snapshots(limit=100)
+        # Reverse so oldest is first (for chart)
+        snapshots = list(reversed(snapshots))
+        return web.json_response({
+            "snapshots": snapshots,
+            "initial_capital": get_settings().initial_capital,
+        })
+
     async def start(self) -> None:
         """Start the web server."""
         app = web.Application()
         app.router.add_get('/', self.handle_status)
         app.router.add_get('/health', self.handle_health)
         app.router.add_get('/api/status', self.handle_api_status)
+        app.router.add_get('/api/test-keys', self.handle_test_keys)
+        app.router.add_get('/api/snapshots', self.handle_snapshots)
 
         self._runner = web.AppRunner(app)
         await self._runner.setup()

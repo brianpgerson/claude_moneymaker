@@ -83,8 +83,29 @@ class TradingEngine:
         self.console.print("[yellow]Syncing balances...[/]")
         if self.settings.trading_mode == TradingMode.LIVE:
             exchange_balances = await self.executor.sync_balances()
-            self.portfolio.sync_from_exchange(exchange_balances)
-            self.console.print(f"  Synced {len(exchange_balances)} holdings")
+
+            if exchange_balances is None:
+                self.console.print("[red]  Failed to sync balances from exchange! Using cached state.[/]")
+                # Don't sync - keep existing portfolio state
+            else:
+                self.portfolio.sync_from_exchange(exchange_balances)
+
+                # Fetch current prices for all positions
+                base = self.settings.base_currency
+                symbols = [f"{sym}/{base}" for sym in exchange_balances.keys() if sym != base and exchange_balances[sym] > 0]
+                if symbols:
+                    prices = await self.executor.get_prices(symbols)
+                    state = self.portfolio.get_state()
+                    for symbol, price in prices.items():
+                        if symbol in state.positions:
+                            pos = state.positions[symbol]
+                            # If no entry price, use current as entry (first sync)
+                            if pos.average_entry_price == 0:
+                                pos.average_entry_price = price
+                            # Update price and recalculate P&L
+                            pos.update_price(price)
+
+                self.console.print(f"  Synced {len(exchange_balances)} holdings")
         else:
             self.console.print("  [dim]Paper mode - using internal tracking[/]")
 
@@ -119,10 +140,20 @@ class TradingEngine:
             f"({fear_greed.get('classification', 'Unknown')})"
         )
 
+        # Get recent trades for context
+        recent_trades = self.portfolio.get_trade_history(limit=10)
+
+        # Get position theses and last decision for context
+        position_theses = self.portfolio.get_position_theses()
+        last_decision = self.portfolio.get_last_decision()
+
         # Step 5: Build market context for Claude
         market_context = self._build_market_context(
             holdings=holdings,
             universe=universe,
+            recent_trades=recent_trades,
+            position_theses=position_theses,
+            last_decision=last_decision,
             fear_greed=fear_greed,
             total_value=state.total_value,
         )
@@ -146,6 +177,9 @@ class TradingEngine:
                 f"  {alloc['symbol']}: {alloc['percent']}% - {alloc['reasoning']}"
             )
         self.console.print(f"  USDT: {decision.get('usdt_percent', 0)}%")
+
+        # Store theses for each position
+        self.portfolio.update_position_theses(decision.get("allocations", []))
 
         # Step 7: Execute trades
         self.console.print("\n[yellow]Executing trades...[/]")
@@ -191,6 +225,32 @@ class TradingEngine:
 
         summary["trades"] = [o.model_dump() for o in orders]
 
+        # Re-sync balances after live trades
+        if self.settings.trading_mode == TradingMode.LIVE and orders:
+            self.console.print("[yellow]Re-syncing balances after trades...[/]")
+            exchange_balances = await self.executor.sync_balances()
+
+            if exchange_balances is not None:
+                self.portfolio.sync_from_exchange(exchange_balances)
+
+                # Fetch current prices for all positions and update P&L
+                base = self.settings.base_currency
+                symbols = [f"{sym}/{base}" for sym in exchange_balances.keys() if sym != base and exchange_balances[sym] > 0]
+                if symbols:
+                    prices = await self.executor.get_prices(symbols)
+                    state = self.portfolio.get_state()
+                    for symbol, price in prices.items():
+                        if symbol in state.positions:
+                            pos = state.positions[symbol]
+                            # If no entry price, use current as entry
+                            if pos.average_entry_price == 0:
+                                pos.average_entry_price = price
+                            pos.update_price(price)
+
+                self.console.print(f"  Synced {len(exchange_balances)} holdings from exchange")
+            else:
+                self.console.print("[red]  Failed to re-sync balances after trades[/]")
+
         # Step 8: Record decision
         self.portfolio.record_decision(
             portfolio_before=holdings,
@@ -205,8 +265,13 @@ class TradingEngine:
             trades_executed=summary["trades"],
         )
 
-        # Step 9: Take snapshot
-        self.portfolio.take_snapshot()
+        # Step 9: Take snapshot with BTC price for benchmarking
+        btc_price = None
+        for coin in universe:
+            if coin.get("symbol") == "BTC/USDT":
+                btc_price = coin.get("price")
+                break
+        self.portfolio.take_snapshot(btc_price=btc_price)
         state = self.portfolio.get_state()
         summary["portfolio"] = {
             "cash": state.cash_balance,
@@ -227,23 +292,77 @@ class TradingEngine:
         self,
         holdings: list[dict],
         universe: list[dict],
+        recent_trades: list[dict],
+        position_theses: dict[str, dict],
+        last_decision: dict | None,
         fear_greed: dict,
         total_value: float,
     ) -> str:
         """Build the market context string for Claude."""
         lines = []
 
-        # Portfolio section
+        # Last decision feedback
+        if last_decision:
+            lines.append("YOUR LAST DECISION:")
+            lines.append(f"  Outlook: {last_decision.get('reasoning', 'N/A')}")
+            lines.append(f"  Conviction: {last_decision.get('conviction', 'N/A')}")
+            lines.append(f"  Time: {last_decision.get('timestamp', 'unknown')[:16]}")
+            allocs = last_decision.get('target_allocation', [])
+            if isinstance(allocs, list):
+                for a in allocs:
+                    lines.append(f"    {a.get('symbol', '?')}: {a.get('percent', 0)}% - {a.get('reasoning', '')[:60]}")
+            lines.append("")
+
+        # Portfolio section with drawdown info
+        initial_capital = self.settings.initial_capital
+        drawdown = ((total_value - initial_capital) / initial_capital) * 100
         lines.append("CURRENT PORTFOLIO:")
-        lines.append(f"Total value: ${total_value:.2f}")
+        lines.append(f"Total value: ${total_value:.2f} (Started: ${initial_capital:.2f}, {drawdown:+.1f}%)")
         lines.append("Holdings:")
 
         for h in holdings:
-            pnl_str = f"{h.get('pnl_pct', 0):+.1%}" if h.get('pnl_pct') else "N/A"
-            lines.append(
-                f"  {h['symbol']}: {h['quantity']:.4f} "
-                f"(${h['value']:.2f}, {h.get('percent', 0):.1f}% of portfolio, P&L: {pnl_str})"
-            )
+            symbol = h['symbol']
+            if symbol == "USDT":
+                lines.append(f"  USDT (cash): ${h['value']:.2f} ({h.get('percent', 0):.1f}% of portfolio)")
+            else:
+                entry_price = h.get('entry_price', 0)
+                pnl_pct = h.get('pnl_pct', 0)
+                pnl_str = f"{pnl_pct:+.1%}" if pnl_pct else "N/A"
+                entry_str = f"entry ${entry_price:.4f}" if entry_price else "entry unknown"
+                # Get thesis and time-in-position
+                full_symbol = f"{symbol}/USDT" if not symbol.endswith("/USDT") else symbol
+                thesis_data = position_theses.get(full_symbol, {})
+                thesis = thesis_data.get("thesis", "") if isinstance(thesis_data, dict) else ""
+                entry_cycle = thesis_data.get("entry_cycle", "") if isinstance(thesis_data, dict) else ""
+
+                # Calculate hours in position
+                time_str = ""
+                if entry_cycle:
+                    try:
+                        from datetime import datetime
+                        entry_time = datetime.fromisoformat(entry_cycle.replace('Z', '+00:00'))
+                        hours_held = (datetime.utcnow() - entry_time.replace(tzinfo=None)).total_seconds() / 3600
+                        time_str = f", held {hours_held:.1f}h"
+                    except:
+                        pass
+
+                thesis_str = f' | YOUR THESIS: "{thesis[:60]}"' if thesis else ""
+                lines.append(
+                    f"  {symbol}: {h['quantity']:.4f} @ ${h['value']/h['quantity'] if h['quantity'] > 0 else 0:.4f} "
+                    f"({entry_str}, {pnl_str}{time_str}) - ${h['value']:.2f}, {h.get('percent', 0):.1f}%{thesis_str}"
+                )
+
+        # Recent trades section
+        if recent_trades:
+            lines.append("")
+            lines.append("RECENT TRADES (last 10):")
+            for trade in recent_trades[:10]:
+                side = trade.get('side', 'unknown').upper()
+                symbol = trade.get('symbol', 'unknown').replace('/USDT', '')
+                qty = trade.get('filled_quantity') or trade.get('quantity', 0)
+                price = trade.get('filled_price', 0)
+                time_str = trade.get('created_at', '')[:16] if trade.get('created_at') else 'unknown'
+                lines.append(f"  {time_str} | {side} {qty:.4f} {symbol} @ ${price:.4f}")
 
         lines.append("")
 
@@ -263,20 +382,22 @@ class TradingEngine:
 
         # Universe table
         lines.append(f"TOP {len(universe)} COINS BY VOLUME:")
-        lines.append("| Symbol | Price | 24h % | RSI | MACD Signal | Vol Ratio |")
-        lines.append("|--------|-------|-------|-----|-------------|-----------|")
+        lines.append("| Symbol | Price | 2h % | 4h % | 24h % | RSI | MACD | Vol |")
+        lines.append("|--------|-------|------|------|-------|-----|------|-----|")
 
         for coin in universe[:30]:  # Limit to top 30 for token efficiency
             symbol = coin["symbol"].replace("/USDT", "")
             price = coin.get("price", 0)
-            change = coin.get("change_24h", 0)
+            change_2h = coin.get("change_2h", 0)
+            change_4h = coin.get("change_4h", 0)
+            change_24h = coin.get("change_24h", 0)
             rsi = coin.get("rsi", 50)
-            macd = coin.get("macd_signal", "neutral")
+            macd = coin.get("macd_signal", "neutral")[:4]  # Shorten for table
             vol_ratio = coin.get("volume_ratio", 1.0)
 
             lines.append(
-                f"| {symbol:<6} | ${price:<10.4f} | {change:+5.1f}% | "
-                f"{rsi:3.0f} | {macd:<11} | {vol_ratio:5.1f}x |"
+                f"| {symbol:<6} | ${price:<7.2f} | {change_2h:+4.1f}% | {change_4h:+4.1f}% | {change_24h:+5.1f}% | "
+                f"{rsi:3.0f} | {macd:<4} | {vol_ratio:3.1f}x |"
             )
 
         lines.append("")
@@ -365,7 +486,9 @@ class TradingEngine:
         """
         self.running = True
         self.console.print("[bold green]Starting MoneyMaker v2...[/]")
-        self.console.print(f"Mode: {self.settings.trading_mode.value}")
+        import os
+        env_mode = os.environ.get("TRADING_MODE", "NOT SET")
+        self.console.print(f"[bold]Mode: {self.settings.trading_mode.value} (env: TRADING_MODE={repr(env_mode)})[/]")
         self.console.print(f"Initial capital: ${self.settings.initial_capital:.2f}")
         self.console.print(f"Universe: Top {self.settings.universe_size} by volume")
         self.console.print(f"Loop interval: {self.settings.loop_interval_minutes} minutes")
