@@ -3,7 +3,7 @@
 from enum import Enum
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,6 +15,7 @@ class TradingMode(str, Enum):
 class Exchange(str, Enum):
     COINBASE = "coinbase"
     BINANCE = "binance"
+    BINANCEUS = "binanceus"
     KRAKEN = "kraken"
 
 
@@ -39,10 +40,22 @@ class Settings(BaseSettings):
     kraken_api_secret: str = Field(default="")
 
     # Trading configuration
-    trading_mode: TradingMode = Field(default=TradingMode.PAPER)
+    trading_mode: TradingMode = Field(default=TradingMode.LIVE)
     initial_capital: float = Field(default=250.0)
+
+    @field_validator("trading_mode", mode="before")
+    @classmethod
+    def parse_trading_mode(cls, v):
+        if isinstance(v, str):
+            v = v.lower().strip()
+            if v == "live":
+                return TradingMode.LIVE
+            elif v == "paper":
+                return TradingMode.PAPER
+        return v
+
     base_currency: str = Field(default="USDT")
-    preferred_exchange: Exchange = Field(default=Exchange.BINANCE)
+    preferred_exchange: Exchange = Field(default=Exchange.BINANCEUS)
 
     # Loop and trading settings
     loop_interval_minutes: int = Field(default=120)  # Every 2 hours
@@ -51,19 +64,21 @@ class Settings(BaseSettings):
     min_cash_pct: float = Field(default=0.05)  # Minimum 5% cash reserve
     universe_size: int = Field(default=50)  # Top N coins by volume
 
-    # Paths
-    data_dir: Path = Field(default=Path("data"))
-    db_path: Path = Field(default=Path("data/moneymaker.db"))
+    # Paths - use absolute path for Railway volume persistence
+    data_dir: Path = Field(default=Path("/app/data"))
+    db_path: Path = Field(default=Path("/app/data/moneymaker.db"))
 
     def get_exchange_credentials(self, exchange: Exchange) -> tuple[str, str]:
         """Get API credentials for a specific exchange."""
         match exchange:
             case Exchange.COINBASE:
                 return self.coinbase_api_key, self.coinbase_api_secret
-            case Exchange.BINANCE:
+            case Exchange.BINANCE | Exchange.BINANCEUS:
                 return self.binance_api_key, self.binance_api_secret
             case Exchange.KRAKEN:
                 return self.kraken_api_key, self.kraken_api_secret
+            case _:
+                return "", ""
 
 
 def get_settings() -> Settings:

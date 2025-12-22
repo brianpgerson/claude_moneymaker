@@ -29,16 +29,13 @@ def run(
         "--interval", "-i",
         help="Minutes between cycles (default: 120)",
     ),
-    paper: bool = typer.Option(
-        True,
-        "--paper/--live",
-        help="Paper trading (simulated) or live (real money!)",
-    ),
 ):
     """
     Run the trading bot.
 
     Opus 4.5 picks coins from top 50 by volume every 2 hours.
+
+    Trading mode is controlled by TRADING_MODE env var (paper/live).
 
     Examples:
         # Paper trade (default)
@@ -49,28 +46,79 @@ def run(
 
         # Custom interval (every 30 minutes)
         moneymaker run -i 30
-
-        # YOLO live trading (careful!)
-        moneymaker run --live
     """
     settings = get_settings()
-    settings.trading_mode = TradingMode.PAPER if paper else TradingMode.LIVE
 
     if interval:
         settings.loop_interval_minutes = interval
 
-    if not paper:
-        console.print("[bold red]" + "=" * 50 + "[/]")
-        console.print("[bold red]         LIVE TRADING MODE[/]")
-        console.print("[bold red]" + "=" * 50 + "[/]")
-        console.print("[red]Real money will be used.[/]")
-        console.print("[red]This bot is AGGRESSIVE - you could lose everything.[/]")
-        confirm = typer.confirm("Continue with live trading?")
-        if not confirm:
-            raise typer.Abort()
-
     engine = TradingEngine(settings)
     asyncio.run(engine.run(cycles=cycles))
+
+
+@app.command()
+def test_keys():
+    """Test API keys and exchange connectivity."""
+    import ccxt.async_support as ccxt
+
+    settings = get_settings()
+
+    console.print("\n[bold cyan]═══ API Key Test ═══[/]")
+
+    # Check if keys are configured
+    console.print(f"\nBinance API Key: ", end="")
+    if settings.binance_api_key:
+        console.print(f"[green]{settings.binance_api_key[:8]}...[/]")
+    else:
+        console.print("[red]NOT SET[/]")
+        return
+
+    console.print(f"Binance API Secret: ", end="")
+    if settings.binance_api_secret:
+        console.print(f"[green]{settings.binance_api_secret[:8]}...[/]")
+    else:
+        console.print("[red]NOT SET[/]")
+        return
+
+    async def test_binance():
+        exchange = ccxt.binance({
+            "apiKey": settings.binance_api_key,
+            "secret": settings.binance_api_secret,
+            "enableRateLimit": True,
+        })
+
+        try:
+            # Test 1: Fetch balance (requires valid key)
+            console.print("\n[yellow]Testing balance fetch...[/]")
+            balance = await exchange.fetch_balance()
+            usdt = balance.get("USDT", {}).get("free", 0)
+            console.print(f"[green]✓ Success! USDT balance: ${usdt:.2f}[/]")
+
+            # Test 2: Fetch ticker (public, but confirms connection)
+            console.print("\n[yellow]Testing market data...[/]")
+            ticker = await exchange.fetch_ticker("BTC/USDT")
+            console.print(f"[green]✓ Success! BTC price: ${ticker['last']:.2f}[/]")
+
+            # Test 3: Check trading permissions
+            console.print("\n[yellow]Checking permissions...[/]")
+            # Try to fetch open orders (requires spot trading permission)
+            orders = await exchange.fetch_open_orders("BTC/USDT")
+            console.print(f"[green]✓ Spot trading enabled! ({len(orders)} open orders)[/]")
+
+            console.print("\n[bold green]All tests passed! Ready for live trading.[/]")
+
+        except ccxt.AuthenticationError as e:
+            console.print(f"[red]✗ Authentication failed: {e}[/]")
+            console.print("[yellow]Check your API key and secret.[/]")
+        except ccxt.PermissionDenied as e:
+            console.print(f"[red]✗ Permission denied: {e}[/]")
+            console.print("[yellow]Enable 'Spot Trading' in Binance API settings.[/]")
+        except Exception as e:
+            console.print(f"[red]✗ Error: {e}[/]")
+        finally:
+            await exchange.close()
+
+    asyncio.run(test_binance())
 
 
 @app.command()
