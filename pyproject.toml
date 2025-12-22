@@ -16,6 +16,7 @@ dependencies = [
     "typer>=0.9.0",          # CLI
     "sqlite-utils>=3.35",    # Simple DB for tracking
     "python-dotenv>=1.0.0",  # Environment variables
+    "aiohttp>=3.9.0",        # Web status server
 ]
 
 [project.optional-dependencies]

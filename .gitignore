@@ -29,7 +29,7 @@ wheels/
 # Data
 *.db
 *.sqlite
-data/
+/data/
 logs/
 
 # IDE

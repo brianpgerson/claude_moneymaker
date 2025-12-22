@@ -95,6 +95,14 @@ class PortfolioManager:
                 "trades_executed": str,   # JSON
             }, pk="id")
 
+        # Position theses - store Claude's reasoning for current positions
+        if "position_theses" not in self.db.table_names():
+            self.db["position_theses"].create({
+                "symbol": str,
+                "thesis": str,
+                "entry_cycle": str,  # When the position was entered
+            }, pk="symbol")
+
     def get_state(self) -> PortfolioState:
         """Get current portfolio state."""
         self._state.calculate_totals(self.initial_capital)
@@ -133,9 +141,11 @@ class PortfolioManager:
                 "pnl_pct": 0,
             })
 
-        # Add positions
+        # Add positions (filter out dust < $1)
         for symbol, pos in state.positions.items():
             value = pos.quantity * pos.current_price
+            if value < 1.0:  # Skip dust positions
+                continue
             holdings.append({
                 "symbol": symbol.replace("/USDT", ""),  # Store without pair suffix
                 "quantity": pos.quantity,
@@ -216,12 +226,18 @@ class PortfolioManager:
             pos.current_price = price
             pos.update_price(price)
 
-            # Remove position if fully closed
+            # Remove position if fully closed or negative (rounding errors)
             if pos.quantity <= 0:
+                if pos.quantity < 0:
+                    print(f"Warning: Position {symbol} went negative ({pos.quantity}), closing at 0")
                 del self._state.positions[symbol]
                 return pos
         else:
-            # New position
+            # New position - only create if positive quantity
+            if quantity_delta <= 0:
+                print(f"Warning: Attempted to create position with non-positive quantity: {symbol} = {quantity_delta}")
+                return Position(symbol=symbol, quantity=0, average_entry_price=price, current_price=price)
+
             pos = Position(
                 symbol=symbol,
                 quantity=quantity_delta,
@@ -280,7 +296,7 @@ class PortfolioManager:
             "target_allocation": json.dumps(target_allocation),
             "conviction": conviction,
             "reasoning": reasoning,
-            "trades_executed": json.dumps(trades_executed),
+            "trades_executed": json.dumps(trades_executed, default=str),
         })
 
     def get_recent_decisions(self, limit: int = 10) -> list[dict]:
@@ -317,6 +333,13 @@ class PortfolioManager:
             "total_pnl_pct": state.total_pnl_pct,
         })
 
+    def get_snapshots(self, limit: int = 100) -> list[dict]:
+        """Get portfolio snapshot history for charting."""
+        return list(self.db["portfolio_snapshots"].rows_where(
+            order_by="-id",
+            limit=limit,
+        ))
+
     def get_trade_history(
         self,
         strategy_name: str | None = None,
@@ -334,6 +357,48 @@ class PortfolioManager:
             order_by="-created_at",
             limit=limit,
         ))
+
+    def update_position_theses(self, allocations: list[dict]) -> None:
+        """Store Claude's thesis for each position."""
+        timestamp = datetime.utcnow().isoformat()
+        for alloc in allocations:
+            symbol = alloc.get("symbol", "")
+            if not symbol:
+                continue
+            # Normalize symbol format
+            if not symbol.endswith("/USDT"):
+                symbol = f"{symbol}/USDT"
+            self.db["position_theses"].upsert({
+                "symbol": symbol,
+                "thesis": alloc.get("reasoning", ""),
+                "entry_cycle": timestamp,
+            }, pk="symbol")
+
+    def get_position_theses(self) -> dict[str, dict]:
+        """Get stored theses for all positions with entry time."""
+        theses = {}
+        for row in self.db["position_theses"].rows:
+            theses[row["symbol"]] = {
+                "thesis": row.get("thesis", ""),
+                "entry_cycle": row.get("entry_cycle", ""),
+            }
+        return theses
+
+    def get_last_decision(self) -> dict | None:
+        """Get the most recent decision with parsed data."""
+        decisions = list(self.db["decisions"].rows_where(
+            order_by="-id",
+            limit=1,
+        ))
+        if not decisions:
+            return None
+        d = decisions[0]
+        try:
+            d["target_allocation"] = json.loads(d.get("target_allocation", "[]"))
+            d["portfolio_before"] = json.loads(d.get("portfolio_before", "[]"))
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return d
 
     def load_state(self) -> None:
         """Load state from database on startup."""
